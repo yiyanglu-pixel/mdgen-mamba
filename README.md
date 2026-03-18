@@ -1,12 +1,21 @@
 # MDGen-Mamba
 
-Fork of [MDGen](https://arxiv.org/abs/2409.17808) (Generative Modeling of Molecular Dynamics Trajectories) by Bowen Jing\*, Hannes Stark\*, Tommi Jaakkola, and Bonnie Berger — with **Mamba (Selective State Space Model) integration** for linear-complexity temporal modeling.
+> **Experimental fork** — This repository is an experimental Mamba integration built on top of the original [MDGen](https://github.com/bjing2016/mdgen) by Bowen Jing\*, Hannes Stark\*, Tommi Jaakkola, and Bonnie Berger ([arXiv:2409.17808](https://arxiv.org/abs/2409.17808)). All original MDGen code, model architecture, and training pipelines remain intact; the Mamba-related modifications are layered on top as an independent research experiment. This fork is maintained by Yiyang Lu (yiyang.lu@stu.ecnu.edu.cn).
 
-We introduce generative modeling of molecular trajectories as a paradigm for learning flexible multi-task surrogate models of MD from data. By conditioning on appropriately chosen frames of the trajectory, such generative models can be adapted to diverse tasks such as forward simulation, transition path sampling, and trajectory upsampling. By alternatively conditioning on part of the molecular system and inpainting the rest, we also demonstrate the first steps towards dynamics-conditioned molecular design. We validate these capabilities on tetrapeptide simulations and show initial steps towards learning trajectories of protein monomers. Methodological details and further evaluations can be found in the paper. Please feel free to reach out to us at bjing@mit.edu, hstark@mit.edu with any questions.
+## About MDGen (original)
 
-**Mamba integration:** This fork replaces the O(n²) self-attention in the temporal dimension (`mha_t`) with Mamba's O(n) selective state space model, enabling scalable generation of long MD trajectories (1,000–10,000+ frames). **Mamba-2 (SSD)** is used by default for chunk-wise parallel computation and better throughput; Mamba-1 is available as a fallback via `--mamba_version 1`. The spatial attention (`mha_l`) and IPA modules are preserved unchanged, maintaining MDGen's physical geometric priors.
+MDGen introduces generative modeling of molecular trajectories as a paradigm for learning flexible multi-task surrogate models of MD from data. By conditioning on appropriately chosen frames of the trajectory, such generative models can be adapted to diverse tasks such as forward simulation, transition path sampling, and trajectory upsampling. By alternatively conditioning on part of the molecular system and inpainting the rest, it also demonstrates the first steps towards dynamics-conditioned molecular design. For questions about the original MDGen, please contact bjing@mit.edu, hstark@mit.edu.
 
-**Note:** This repository is provided for research reproducibility and is not intended for usage in application workflows.
+## What this fork adds — Mamba integration
+
+This fork replaces the O(n²) temporal self-attention (`mha_t`) in MDGen with [Mamba](https://github.com/state-spaces/mamba)'s O(n) selective state space model, targeting scalable generation of long MD trajectories (1,000–10,000+ frames). The key changes are:
+
+- **Mamba-2 (SSD) by default** — chunk-wise parallel computation with better throughput; Mamba-1 available as fallback via `--mamba_version 1`
+- **Bidirectional Mamba (BiMamba)** — runs forward + backward scans and combines results (concat/add/gate), critical for non-causal MD dynamics
+- **Drop-in replacement** — only the temporal attention dimension is modified; spatial attention (`mha_l`), IPA, and all geometric priors are preserved unchanged
+- **Auto-alignment** — `headdim` and sequence length are automatically adjusted to satisfy Mamba-2's CUDA kernel stride constraints
+
+**Note:** This repository is provided for research reproducibility and is not intended for production workflows. The Mamba integration is experimental and under active development.
 
 ![mdgen.png](mdgen.png)
 
@@ -300,11 +309,19 @@ Tables and figures in the paper are extracted from these pickle files.
 - **P3 — Method C — Hybrid architecture**: Mix Mamba and Transformer layers (e.g., 3:1 ratio) to combine Mamba's linear complexity with Transformer's global information mixing
 - **Ablation studies**: Systematic comparison of combine modes (concat vs gate vs add), d_state values, and Mamba vs Attention across trajectory lengths and residue counts
 
+## Contact
+
+- **Mamba integration (this fork):** Yiyang Lu — yiyang.lu@stu.ecnu.edu.cn
+- **Original MDGen:** Bowen Jing (bjing@mit.edu), Hannes Stark (hstark@mit.edu)
+
 ## License
 
 MIT. Additional licenses may apply for third-party source code noted in file headers.
 
 ## Citation
+
+If you use this codebase, please cite the original MDGen paper:
+
 ```
 @misc{jing2024generativemodelingmoleculardynamics,
       title={Generative Modeling of Molecular Dynamics Trajectories},
