@@ -10,7 +10,8 @@ O(n²) self-attention mechanism for processing long MD trajectories.
 
 import torch
 import torch.nn as nn
-from typing import Optional
+import torch.nn.functional as F
+from typing import Optional, Tuple
 
 # Import Mamba v1 and v2 with graceful fallback
 MAMBA_AVAILABLE = False
@@ -83,6 +84,26 @@ def _build_mamba(version: int, d_model: int, d_state: int, d_conv: int,
         )
 
 
+_MAMBA2_SEQ_ALIGN = 8  # Mamba-2's causal_conv1d requires seq-dim strides % 8 == 0
+
+
+def _pad_seq(x: torch.Tensor, align: int = _MAMBA2_SEQ_ALIGN) -> Tuple[torch.Tensor, int]:
+    """Pad sequence dim (dim=1) to a multiple of `align`. Returns (padded_x, pad_size)."""
+    T = x.shape[1]
+    remainder = T % align
+    if remainder == 0:
+        return x, 0
+    pad_size = align - remainder
+    return F.pad(x, (0, 0, 0, pad_size)), pad_size  # pad last-2 dim (seq) on the right
+
+
+def _pad_mask(mask: Optional[torch.Tensor], pad_size: int) -> Optional[torch.Tensor]:
+    """Pad mask (B, T) with zeros on the right."""
+    if mask is None or pad_size == 0:
+        return mask
+    return F.pad(mask, (0, pad_size), value=0)
+
+
 class MambaOperator(nn.Module):
     """Mamba wrapper for temporal modeling in MDGEN.
 
@@ -123,12 +144,19 @@ class MambaOperator(nn.Module):
         Returns:
             Output tensor of shape (B, T, C)
         """
+        T_orig = x.shape[1]
         if mask is not None:
             x = x * mask.unsqueeze(-1).float()
 
+        # Mamba-2's causal_conv1d requires seq-length strides aligned to 8
+        x, pad_size = _pad_seq(x)
+        if pad_size > 0 and mask is not None:
+            mask = _pad_mask(mask, pad_size)
+
         if not x.is_contiguous():
             x = x.contiguous()
-        return self.mamba(x)
+        out = self.mamba(x)
+        return out[:, :T_orig, :]
 
 
 class BiMambaOperator(nn.Module):
@@ -185,8 +213,12 @@ class BiMambaOperator(nn.Module):
         Returns:
             Output tensor of shape (B, T, C)
         """
+        T_orig = x.shape[1]
         if mask is not None:
             x = x * mask.unsqueeze(-1).float()
+
+        # Mamba-2's causal_conv1d requires seq-length strides aligned to 8
+        x, pad_size = _pad_seq(x)
 
         if not x.is_contiguous():
             x = x.contiguous()
@@ -212,7 +244,7 @@ class BiMambaOperator(nn.Module):
         else:
             raise ValueError(f"Unknown combine_mode: {self.combine_mode}")
 
-        return out
+        return out[:, :T_orig, :]
 
 
 class MambaTemporalBlock(nn.Module):
