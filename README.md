@@ -169,7 +169,19 @@ python train.py --sim_condition --train_split splits/atlas_train.csv --val_split
 
 ### Training with Mamba
 
-Add `--mamba` (and optionally `--bi_mamba`) to any training command to replace temporal attention with Mamba. All other arguments remain the same.
+Add `--mamba` (and optionally `--bi_mamba`) to any training command to replace temporal attention with Mamba. **Mamba-2 (SSD) is used by default** (`--mamba_version 2`), providing chunk-wise parallel computation. Both training and inference automatically use the same Mamba version — no separate configuration needed for inference.
+
+#### Quick test (20 epochs, recommended first step)
+
+```
+python train.py --sim_condition --mamba --bi_mamba \
+    --train_split splits/4AA_train.csv --val_split splits/4AA_val.csv \
+    --data_dir data/4AA_data/ --num_frames 50 --prepend_ipa --abs_pos_emb \
+    --crop 4 --ckpt_freq 10 --val_repeat 5 --suffix _i100 --epochs 20 \
+    --run_name test_mamba2_20ep
+```
+
+#### Full training examples
 
 ```
 # Forward simulation with bidirectional Mamba (recommended)
@@ -231,9 +243,13 @@ wget https://storage.googleapis.com/mdgen-public/weights/atlas.ckpt
 
 ## Inference
 
-Commands similar to these were used to obtain the samples analyzed in the paper.
+Inference automatically uses the same Mamba version that was used during training (saved in the checkpoint's `hparams`). No extra flags needed — just point to the Mamba-trained checkpoint.
+
 ```
-# Forward simulation
+# Inference with Mamba-2 trained checkpoint
+python sim_inference.py --sim_ckpt [MAMBA_CKPT] --data_dir share/4AA_sims --split splits/4AA_test.csv --num_rollouts 10 --num_frames 1000 --xtc --out_dir [DIR]
+
+# Original MDGen inference (without Mamba)
 python sim_inference.py --sim_ckpt forward_sim.ckpt --data_dir share/4AA_sims --split splits/4AA_test.csv --num_rollouts 10 --num_frames 1000 --xtc --out_dir [DIR]
 
 # Interpolation / TPS
@@ -274,12 +290,12 @@ Tables and figures in the paper are extracted from these pickle files.
 
 ## Roadmap
 
-### Completed (current)
-- **Method A — Temporal Mamba**: Replace `mha_t` with bidirectional Mamba (v1/v2), preserving `mha_l` and IPA unchanged
-- Bug fixes: weight initialization protection, mask handling, d_state defaults, combine mode
+### Completed
+- **P1 — Method A — Temporal Mamba**: Replace `mha_t` with bidirectional Mamba, preserving `mha_l` and IPA unchanged
+- **P1 — Bug fixes**: Weight initialization protection, mask handling, d_state defaults, combine mode
+- **P2 — Upgrade to Mamba-2**: Default to `mamba_ssm.Mamba2` with chunk-wise parallel SSD, `headdim` control, and auto-alignment of inner dimensions; Mamba-1 available via `--mamba_version 1`; added `--mamba_combine_mode` CLI argument
 
 ### Planned
-- **P2 — Upgrade to Mamba-2** (done): Default to `mamba_ssm.Mamba2` with chunk-wise parallel SSD, `headdim` control, and auto-alignment of inner dimensions; Mamba-1 available via `--mamba_version 1`; added `--mamba_combine_mode` CLI argument
 - **P3 — Method B — Spatial Mamba**: Add optional Mamba replacement for `mha_l` (spatial attention) to scale to proteins with L > 100 residues
 - **P3 — Method C — Hybrid architecture**: Mix Mamba and Transformer layers (e.g., 3:1 ratio) to combine Mamba's linear complexity with Transformer's global information mixing
 - **Ablation studies**: Systematic comparison of combine modes (concat vs gate vs add), d_state values, and Mamba vs Attention across trajectory lengths and residue counts
