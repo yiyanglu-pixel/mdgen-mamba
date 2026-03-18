@@ -133,14 +133,30 @@ class LatentMDGenModel(nn.Module):
         self.initialize_weights()
 
     def initialize_weights(self):
-        # Initialize transformer layers:
+        # Initialize transformer layers, but skip Mamba internal modules
+        # which have carefully designed initialization (e.g. dt_proj bias
+        # uses log-space init critical for SSM dynamics).
+        mamba_module_names = set()
+        for name, module in self.named_modules():
+            if 'mamba_forward' in name or 'mamba_backward' in name or '.mamba.mamba' in name:
+                mamba_module_names.add(name)
+
         def _basic_init(module):
             if isinstance(module, nn.Linear):
                 torch.nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
 
-        self.apply(_basic_init)
+        for name, module in self.named_modules():
+            # Skip Mamba SSM internal modules — their dt_proj, in_proj, out_proj
+            # have specialized initialization that must not be overwritten.
+            skip = False
+            for mamba_name in mamba_module_names:
+                if name.startswith(mamba_name):
+                    skip = True
+                    break
+            if not skip:
+                _basic_init(module)
 
         if self.args.prepend_ipa:
             for block in self.ipa_layers:
@@ -399,7 +415,7 @@ class LatentMDGenLayer(nn.Module):
         self.embed_dim = embed_dim
         self.num_frames = num_frames
         self.hyena = hyena
-        self.mamba = mamba
+        self.use_mamba = mamba
         self.bi_mamba = bi_mamba
         self.mamba_d_state = mamba_d_state
         self.mamba_d_conv = mamba_d_conv
@@ -429,9 +445,9 @@ class LatentMDGenLayer(nn.Module):
                 order=2,
                 filter_order=64,
             )
-        elif self.mamba:
-            from .mamba_operators import MambaWithRoPE
-            self.mha_t = MambaWithRoPE(
+        elif self.use_mamba:
+            from .mamba_operators import MambaTemporalBlock
+            self.mha_t = MambaTemporalBlock(
                 d_model=self.embed_dim,
                 bidirectional=self.bi_mamba,
                 d_state=self.mamba_d_state,
@@ -487,7 +503,7 @@ class LatentMDGenLayer(nn.Module):
             x = self.mha_t(
                 x.transpose(1, 2).reshape(B * L, T, C)
             ).reshape(B, L, T, C).transpose(1, 2)
-        elif self.mamba:
+        elif self.use_mamba:
             # Mamba handles sequences with (B, T, C) format
             x = self.mha_t(
                 x.transpose(1, 2).reshape(B * L, T, C),
