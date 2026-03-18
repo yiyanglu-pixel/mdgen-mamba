@@ -127,6 +127,22 @@ LatentMDGenLayer forward:
 
 ## Training
 
+### Data path and `--suffix` flag
+
+The preprocessed data files are named `{peptide_name}{suffix}.npy` (e.g., `AADY_i100.npy`). The `--suffix` flag tells the data loader which suffix to append when loading files:
+
+- **Forward simulation / TPS** (stride=100): files are `*_i100.npy` → use `--suffix _i100`
+- **Upsampling / Inpainting** (stride=1): files are `*.npy` (no suffix) → omit `--suffix`
+- **ATLAS** (stride=40): files are `*_i40.npy` → use `--suffix _i40`
+
+Example data directory layout:
+```
+data/4AA_data/
+├── AADY_i100.npy      # --suffix _i100
+├── ADIY_i100.npy
+├── ...
+```
+
 ### Original MDGen training (without Mamba)
 
 Commands similar to these were used to train the models presented in the paper.
