@@ -197,9 +197,12 @@ class NewMDGenWrapper(Wrapper):
         
         # Default numeric Mamba args
         for key, default in [
+            ('mamba_version', 2),
             ('mamba_d_state', 64),
             ('mamba_d_conv', 4),
             ('mamba_expand', 2),
+            ('mamba_headdim', 64),
+            ('mamba_combine_mode', 'concat'),
         ]:
             if not hasattr(args, key):
                 setattr(args, key, default)

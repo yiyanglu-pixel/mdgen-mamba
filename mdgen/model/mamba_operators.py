@@ -3,21 +3,127 @@
 """
 Mamba-based operators for MDGEN temporal modeling.
 
+Supports both Mamba-1 (selective scan) and Mamba-2 (SSD, chunk-wise parallel).
 These modules provide O(n) linear-complexity alternatives to the standard
 O(n²) self-attention mechanism for processing long MD trajectories.
 """
 
 import torch
 import torch.nn as nn
-from typing import Optional
+import torch.nn.functional as F
+from typing import Optional, Tuple
 
-# Try to import Mamba components - use Mamba v1 instead of Mamba2 for better compatibility
+# Import Mamba v1 and v2 with graceful fallback
+MAMBA_AVAILABLE = False
+MAMBA2_AVAILABLE = False
+Mamba = None
+Mamba2 = None
+
 try:
     from mamba_ssm import Mamba
     MAMBA_AVAILABLE = True
 except ImportError:
-    MAMBA_AVAILABLE = False
-    Mamba = None
+    pass
+
+try:
+    from mamba_ssm import Mamba2
+    MAMBA2_AVAILABLE = True
+except ImportError:
+    pass
+
+
+def _get_mamba_cls(version: int):
+    """Return the appropriate Mamba class for the requested version."""
+    if version == 2:
+        if MAMBA2_AVAILABLE:
+            return Mamba2
+        if MAMBA_AVAILABLE:
+            import warnings
+            warnings.warn(
+                "Mamba2 not available, falling back to Mamba v1. "
+                "Install mamba-ssm >= 2.0 for Mamba-2 support.",
+                stacklevel=3,
+            )
+            return Mamba
+    elif version == 1:
+        if MAMBA_AVAILABLE:
+            return Mamba
+    raise ImportError(
+        f"Mamba v{version} is not installed. Please install with: "
+        "pip install mamba-ssm causal-conv1d"
+    )
+
+
+def _build_mamba(version: int, d_model: int, d_state: int, d_conv: int,
+                 expand: int, headdim: int):
+    """Instantiate a Mamba v1 or v2 block with the right kwargs.
+
+    For Mamba-2, two alignment constraints must be satisfied:
+      1. d_inner (= d_model * expand) must be divisible by headdim
+      2. nheads (= d_inner / headdim) must be a multiple of 8, because
+         d_in_proj = 2*d_inner + 2*ngroups*d_state + nheads and causal_conv1d
+         requires stride(2) = d_in_proj to be a multiple of 8.  The first two
+         terms are already multiples of 8, so nheads % 8 == 0 is sufficient.
+    If the requested headdim violates either constraint, it is automatically
+    adjusted downward to the largest valid value.
+    """
+    cls = _get_mamba_cls(version)
+    if cls is Mamba2:
+        d_inner = d_model * expand
+        # Find largest headdim <= requested that satisfies both constraints
+        if (d_inner % headdim != 0) or ((d_inner // headdim) % 8 != 0):
+            orig_headdim = headdim
+            headdim = None
+            for hd in range(orig_headdim, 0, -1):
+                if d_inner % hd == 0 and (d_inner // hd) % 8 == 0:
+                    headdim = hd
+                    break
+            if headdim is None:
+                raise ValueError(
+                    f"Cannot find valid headdim for d_inner={d_inner}: "
+                    f"need d_inner % headdim == 0 and (d_inner/headdim) % 8 == 0"
+                )
+        nheads = d_inner // headdim
+        d_in_proj = 2 * d_inner + 2 * d_state + nheads  # ngroups=1
+        assert d_in_proj % 8 == 0, (
+            f"d_in_proj={d_in_proj} not aligned to 8 "
+            f"(d_inner={d_inner}, headdim={headdim}, nheads={nheads})"
+        )
+        return cls(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            headdim=headdim,
+        )
+    else:
+        # Mamba v1 — does not accept headdim
+        return cls(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+
+
+_MAMBA2_SEQ_ALIGN = 8  # Mamba-2's causal_conv1d requires seq-dim strides % 8 == 0
+
+
+def _pad_seq(x: torch.Tensor, align: int = _MAMBA2_SEQ_ALIGN) -> Tuple[torch.Tensor, int]:
+    """Pad sequence dim (dim=1) to a multiple of `align`. Returns (padded_x, pad_size)."""
+    T = x.shape[1]
+    remainder = T % align
+    if remainder == 0:
+        return x, 0
+    pad_size = align - remainder
+    return F.pad(x, (0, 0, 0, pad_size)), pad_size  # pad last-2 dim (seq) on the right
+
+
+def _pad_mask(mask: Optional[torch.Tensor], pad_size: int) -> Optional[torch.Tensor]:
+    """Pad mask (B, T) with zeros on the right."""
+    if mask is None or pad_size == 0:
+        return mask
+    return F.pad(mask, (0, pad_size), value=0)
 
 
 class MambaOperator(nn.Module):
@@ -32,6 +138,8 @@ class MambaOperator(nn.Module):
         d_state: SSM state dimension (default 64, aligned with parsing.py)
         d_conv: Convolution kernel size
         expand: Expansion factor for inner dimension
+        mamba_version: 1 for Mamba-1, 2 for Mamba-2 (default)
+        headdim: Head dimension for Mamba-2 grouped SSD (ignored by v1)
     """
 
     def __init__(
@@ -40,22 +148,14 @@ class MambaOperator(nn.Module):
         d_state: int = 64,
         d_conv: int = 4,
         expand: int = 2,
+        mamba_version: int = 2,
+        headdim: int = 64,
     ):
         super().__init__()
-        if not MAMBA_AVAILABLE:
-            raise ImportError(
-                "Mamba is not installed. Please install with: "
-                "pip install mamba-ssm causal-conv1d"
-            )
-
         self.d_model = d_model
-        # Use Mamba v1 instead of Mamba2 for better compatibility
-        self.mamba = Mamba(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
-        )
+        self.mamba_version = mamba_version
+        self.mamba = _build_mamba(mamba_version, d_model, d_state, d_conv,
+                                 expand, headdim)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -66,15 +166,19 @@ class MambaOperator(nn.Module):
         Returns:
             Output tensor of shape (B, T, C)
         """
-        # Zero out padding positions so SSM state is not polluted
+        T_orig = x.shape[1]
         if mask is not None:
             x = x * mask.unsqueeze(-1).float()
 
-        # Mamba v1 expects (B, L, D) and returns same shape
-        # Ensure contiguous for CUDA
+        # Mamba-2's causal_conv1d requires seq-length strides aligned to 8
+        x, pad_size = _pad_seq(x)
+        if pad_size > 0 and mask is not None:
+            mask = _pad_mask(mask, pad_size)
+
         if not x.is_contiguous():
             x = x.contiguous()
-        return self.mamba(x)
+        out = self.mamba(x)
+        return out[:, :T_orig, :]
 
 
 class BiMambaOperator(nn.Module):
@@ -90,6 +194,8 @@ class BiMambaOperator(nn.Module):
         d_conv: Convolution kernel size
         expand: Expansion factor
         combine_mode: How to combine forward/backward outputs ('add', 'concat', 'gate')
+        mamba_version: 1 for Mamba-1, 2 for Mamba-2 (default)
+        headdim: Head dimension for Mamba-2 (ignored by v1)
     """
 
     def __init__(
@@ -99,38 +205,22 @@ class BiMambaOperator(nn.Module):
         d_conv: int = 4,
         expand: int = 2,
         combine_mode: str = 'concat',
+        mamba_version: int = 2,
+        headdim: int = 64,
     ):
         super().__init__()
-        if not MAMBA_AVAILABLE:
-            raise ImportError(
-                "Mamba is not installed. Please install with: "
-                "pip install mamba-ssm causal-conv1d"
-            )
-
         self.d_model = d_model
         self.combine_mode = combine_mode
+        self.mamba_version = mamba_version
 
-        # Forward Mamba (v1)
-        self.mamba_forward = Mamba(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
-        )
-
-        # Backward Mamba (v1)
-        self.mamba_backward = Mamba(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
-        )
+        self.mamba_forward = _build_mamba(mamba_version, d_model, d_state,
+                                         d_conv, expand, headdim)
+        self.mamba_backward = _build_mamba(mamba_version, d_model, d_state,
+                                          d_conv, expand, headdim)
 
         if combine_mode == 'concat':
-            # Project concatenated outputs back to d_model
             self.combine_proj = nn.Linear(2 * d_model, d_model)
         elif combine_mode == 'gate':
-            # Learnable gating between forward and backward
             self.gate = nn.Sequential(
                 nn.Linear(2 * d_model, d_model),
                 nn.Sigmoid()
@@ -145,12 +235,13 @@ class BiMambaOperator(nn.Module):
         Returns:
             Output tensor of shape (B, T, C)
         """
-        # Zero out padding positions so SSM state is not polluted
+        T_orig = x.shape[1]
         if mask is not None:
             x = x * mask.unsqueeze(-1).float()
 
-        # Mamba v1 has fewer stride restrictions than Mamba2
-        # Just ensure contiguous for CUDA
+        # Mamba-2's causal_conv1d requires seq-length strides aligned to 8
+        x, pad_size = _pad_seq(x)
+
         if not x.is_contiguous():
             x = x.contiguous()
 
@@ -164,21 +255,18 @@ class BiMambaOperator(nn.Module):
 
         # Combine forward and backward
         if self.combine_mode == 'add':
-            # Simple averaging
             out = (out_forward + out_backward) / 2
         elif self.combine_mode == 'concat':
-            # Concatenate and project
             out = torch.cat([out_forward, out_backward], dim=-1)
             out = self.combine_proj(out)
         elif self.combine_mode == 'gate':
-            # Learnable gating
             combined = torch.cat([out_forward, out_backward], dim=-1)
             gate = self.gate(combined)
             out = gate * out_forward + (1 - gate) * out_backward
         else:
             raise ValueError(f"Unknown combine_mode: {self.combine_mode}")
 
-        return out
+        return out[:, :T_orig, :]
 
 
 class MambaTemporalBlock(nn.Module):
@@ -195,6 +283,8 @@ class MambaTemporalBlock(nn.Module):
         d_conv: Convolution kernel size
         expand: Expansion factor
         combine_mode: For BiMamba, how to combine directions
+        mamba_version: 1 for Mamba-1, 2 for Mamba-2 (default)
+        headdim: Head dimension for Mamba-2 (ignored by v1)
     """
 
     def __init__(
@@ -205,27 +295,23 @@ class MambaTemporalBlock(nn.Module):
         d_conv: int = 4,
         expand: int = 2,
         combine_mode: str = 'concat',
+        mamba_version: int = 2,
+        headdim: int = 64,
         **kwargs  # Absorb unused args like num_heads, add_bias_kv, etc.
     ):
         super().__init__()
         self.d_model = d_model
         self.bidirectional = bidirectional
 
+        mamba_kwargs = dict(
+            d_model=d_model, d_state=d_state, d_conv=d_conv,
+            expand=expand, mamba_version=mamba_version, headdim=headdim,
+        )
+
         if bidirectional:
-            self.mamba = BiMambaOperator(
-                d_model=d_model,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
-                combine_mode=combine_mode,
-            )
+            self.mamba = BiMambaOperator(combine_mode=combine_mode, **mamba_kwargs)
         else:
-            self.mamba = MambaOperator(
-                d_model=d_model,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
-            )
+            self.mamba = MambaOperator(**mamba_kwargs)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -243,6 +329,8 @@ class MambaTemporalBlock(nn.Module):
 MambaWithRoPE = MambaTemporalBlock
 
 
-def check_mamba_available() -> bool:
+def check_mamba_available(version: int = 2) -> bool:
     """Check if Mamba is available for import."""
+    if version == 2:
+        return MAMBA2_AVAILABLE or MAMBA_AVAILABLE
     return MAMBA_AVAILABLE

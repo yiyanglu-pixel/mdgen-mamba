@@ -100,9 +100,12 @@ class LatentMDGenModel(nn.Module):
                     ipa_args=ipa_args if args.interleave_ipa else None,
                     mamba=getattr(args, 'mamba', False),
                     bi_mamba=getattr(args, 'bi_mamba', False),
+                    mamba_version=getattr(args, 'mamba_version', 2),
                     mamba_d_state=getattr(args, 'mamba_d_state', 64),
                     mamba_d_conv=getattr(args, 'mamba_d_conv', 4),
                     mamba_expand=getattr(args, 'mamba_expand', 2),
+                    mamba_headdim=getattr(args, 'mamba_headdim', 64),
+                    mamba_combine_mode=getattr(args, 'mamba_combine_mode', 'concat'),
                 )
                 for _ in range(args.num_layers)
             ]
@@ -410,16 +413,20 @@ class LatentMDGenLayer(nn.Module):
 
     def __init__(self, embed_dim, ffn_embed_dim, mha_heads, dropout=0.0, num_frames=50, hyena=False,
                  use_rotary_embeddings=False, use_time_attention=True, ipa_args=None,
-                 mamba=False, bi_mamba=False, mamba_d_state=64, mamba_d_conv=4, mamba_expand=2):
+                 mamba=False, bi_mamba=False, mamba_version=2, mamba_d_state=64,
+                 mamba_d_conv=4, mamba_expand=2, mamba_headdim=64, mamba_combine_mode='concat'):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_frames = num_frames
         self.hyena = hyena
         self.use_mamba = mamba
         self.bi_mamba = bi_mamba
+        self.mamba_version = mamba_version
         self.mamba_d_state = mamba_d_state
         self.mamba_d_conv = mamba_d_conv
         self.mamba_expand = mamba_expand
+        self.mamba_headdim = mamba_headdim
+        self.mamba_combine_mode = mamba_combine_mode
         self.ffn_embed_dim = ffn_embed_dim
         self.mha_heads = mha_heads
         self.inf = 1e5
@@ -453,6 +460,9 @@ class LatentMDGenLayer(nn.Module):
                 d_state=self.mamba_d_state,
                 d_conv=self.mamba_d_conv,
                 expand=self.mamba_expand,
+                combine_mode=self.mamba_combine_mode,
+                mamba_version=self.mamba_version,
+                headdim=self.mamba_headdim,
             )
         else:
             self.mha_t = AttentionWithRoPE(

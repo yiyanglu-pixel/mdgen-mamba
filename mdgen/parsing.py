@@ -101,12 +101,19 @@ def parse_train_args():
                        help='Use Mamba for temporal attention instead of standard attention')
     group.add_argument('--bi_mamba', action='store_true',
                        help='Use bidirectional Mamba (requires --mamba)')
+    group.add_argument('--mamba_version', type=int, default=2, choices=[1, 2],
+                       help='Mamba version: 1=selective scan, 2=SSD chunk-parallel (default 2)')
     group.add_argument('--mamba_d_state', type=int, default=64,
                        help='State dimension for Mamba SSM')
     group.add_argument('--mamba_d_conv', type=int, default=4,
                        help='Convolution kernel size for Mamba')
     group.add_argument('--mamba_expand', type=int, default=2,
                        help='Expansion factor for Mamba inner dimension')
+    group.add_argument('--mamba_headdim', type=int, default=64,
+                       help='Head dimension for Mamba-2 grouped SSD (ignored by v1)')
+    group.add_argument('--mamba_combine_mode', type=str, default='concat',
+                       choices=['add', 'concat', 'gate'],
+                       help='How BiMamba combines forward/backward: add, concat, gate')
 
     group = parser.add_argument_group("Transport arguments")
     group.add_argument("--path-type", type=str, default="GVP", choices=["Linear", "GVP", "VP"])
