@@ -4,7 +4,7 @@ Fork of [MDGen](https://arxiv.org/abs/2409.17808) (Generative Modeling of Molecu
 
 We introduce generative modeling of molecular trajectories as a paradigm for learning flexible multi-task surrogate models of MD from data. By conditioning on appropriately chosen frames of the trajectory, such generative models can be adapted to diverse tasks such as forward simulation, transition path sampling, and trajectory upsampling. By alternatively conditioning on part of the molecular system and inpainting the rest, we also demonstrate the first steps towards dynamics-conditioned molecular design. We validate these capabilities on tetrapeptide simulations and show initial steps towards learning trajectories of protein monomers. Methodological details and further evaluations can be found in the paper. Please feel free to reach out to us at bjing@mit.edu, hstark@mit.edu with any questions.
 
-**Mamba integration:** This fork replaces the O(n²) self-attention in the temporal dimension (`mha_t`) with Mamba's O(n) selective state space model, enabling scalable generation of long MD trajectories (1,000–10,000+ frames). The spatial attention (`mha_l`) and IPA modules are preserved unchanged, maintaining MDGen's physical geometric priors.
+**Mamba integration:** This fork replaces the O(n²) self-attention in the temporal dimension (`mha_t`) with Mamba's O(n) selective state space model, enabling scalable generation of long MD trajectories (1,000–10,000+ frames). **Mamba-2 (SSD)** is used by default for chunk-wise parallel computation and better throughput; Mamba-1 is available as a fallback via `--mamba_version 1`. The spatial attention (`mha_l`) and IPA modules are preserved unchanged, maintaining MDGen's physical geometric priors.
 
 **Note:** This repository is provided for research reproducibility and is not intended for usage in application workflows.
 
@@ -90,9 +90,10 @@ LatentMDGenLayer forward:
 
 | Class | Description |
 |-------|-------------|
-| `MambaOperator` | Unidirectional Mamba-1 wrapper. Input/output: `(B, T, C)`. Linear complexity O(T). |
+| `MambaOperator` | Unidirectional Mamba wrapper (v1 or v2). Input/output: `(B, T, C)`. Linear complexity O(T). |
 | `BiMambaOperator` | Bidirectional Mamba — runs forward + backward, combines via concat projection (default), averaging, or learned gating. Essential for MD where causality is not enforced. |
 | `MambaTemporalBlock` | Drop-in replacement for `AttentionWithRoPE`. Wraps `BiMambaOperator` (default) or `MambaOperator` based on `bidirectional` flag. |
+| `_build_mamba()` | Factory function that instantiates Mamba v1 or v2 with appropriate kwargs (auto-adjusts `headdim` for v2 alignment constraints). |
 
 ### CLI arguments
 
@@ -100,9 +101,12 @@ LatentMDGenLayer forward:
 |----------|------|---------|-------------|
 | `--mamba` | flag | `False` | Enable Mamba for temporal attention (`mha_t`) |
 | `--bi_mamba` | flag | `False` | Use bidirectional Mamba (requires `--mamba`) |
+| `--mamba_version` | int | `2` | Mamba version: `1` = selective scan, `2` = SSD chunk-parallel |
 | `--mamba_d_state` | int | `64` | SSM state dimension. Larger = more memory, better long-range recall |
 | `--mamba_d_conv` | int | `4` | Local convolution kernel size inside Mamba |
 | `--mamba_expand` | int | `2` | Expansion factor for Mamba's inner dimension |
+| `--mamba_headdim` | int | `64` | Head dimension for Mamba-2 grouped SSD (ignored by v1) |
+| `--mamba_combine_mode` | str | `concat` | BiMamba combine: `add`, `concat`, `gate` |
 
 ### Modified files
 
@@ -111,7 +115,7 @@ LatentMDGenLayer forward:
 | `mdgen/model/mamba_operators.py` | **New file.** `MambaOperator`, `BiMambaOperator`, `MambaTemporalBlock` |
 | `mdgen/model/latent_model.py` | `LatentMDGenLayer.__init__`: Mamba branch in `_init_submodules`; `forward`: Mamba branch for temporal dim; `initialize_weights`: skip Mamba internal modules to preserve SSM initialization |
 | `mdgen/wrapper.py` | `NewMDGenWrapper`: pass Mamba parameters to model |
-| `mdgen/parsing.py` | Add `--mamba`, `--bi_mamba`, `--mamba_d_state`, `--mamba_d_conv`, `--mamba_expand` arguments |
+| `mdgen/parsing.py` | Add `--mamba`, `--bi_mamba`, `--mamba_version`, `--mamba_d_state`, `--mamba_d_conv`, `--mamba_expand`, `--mamba_headdim`, `--mamba_combine_mode` arguments |
 
 ### Key design decisions & bug fixes
 
@@ -189,13 +193,20 @@ python train.py --tps_condition --mamba --bi_mamba \
     --crop 4 --ckpt_freq 40 --val_repeat 25 --suffix _i100 --epochs 10000 \
     --wandb --run_name tps_mamba
 
-# Custom Mamba hyperparameters
+# Custom Mamba hyperparameters (Mamba-2 is default)
 python train.py --sim_condition --mamba --bi_mamba \
     --mamba_d_state 128 --mamba_d_conv 8 --mamba_expand 4 \
     --train_split splits/4AA_train.csv --val_split splits/4AA_val.csv \
     --data_dir data/4AA_data/ --num_frames 1000 --prepend_ipa --abs_pos_emb \
     --crop 4 --ckpt_freq 40 --val_repeat 25 --suffix _i100 --epochs 10000 \
     --wandb --run_name sim_mamba_large_state
+
+# Fallback to Mamba-1 if mamba-ssm < 2.0
+python train.py --sim_condition --mamba --bi_mamba --mamba_version 1 \
+    --train_split splits/4AA_train.csv --val_split splits/4AA_val.csv \
+    --data_dir data/4AA_data/ --num_frames 50 --prepend_ipa --abs_pos_emb \
+    --crop 4 --ckpt_freq 40 --val_repeat 25 --suffix _i100 --epochs 10000 \
+    --wandb --run_name sim_mamba_v1
 
 # Long trajectory (5000 frames) — where Mamba's O(n) complexity matters most
 python train.py --sim_condition --mamba --bi_mamba \
@@ -264,11 +275,11 @@ Tables and figures in the paper are extracted from these pickle files.
 ## Roadmap
 
 ### Completed (current)
-- **Method A — Temporal Mamba**: Replace `mha_t` with bidirectional Mamba-1, preserving `mha_l` and IPA unchanged
+- **Method A — Temporal Mamba**: Replace `mha_t` with bidirectional Mamba (v1/v2), preserving `mha_l` and IPA unchanged
 - Bug fixes: weight initialization protection, mask handling, d_state defaults, combine mode
 
 ### Planned
-- **P2 — Upgrade to Mamba-2**: Replace `mamba_ssm.Mamba` with `mamba_ssm.Mamba2` for chunk-wise parallel SSD, larger native d_state (64-128), and `seq_idx` support for variable-length sequences
+- **P2 — Upgrade to Mamba-2** (done): Default to `mamba_ssm.Mamba2` with chunk-wise parallel SSD, `headdim` control, and auto-alignment of inner dimensions; Mamba-1 available via `--mamba_version 1`; added `--mamba_combine_mode` CLI argument
 - **P3 — Method B — Spatial Mamba**: Add optional Mamba replacement for `mha_l` (spatial attention) to scale to proteins with L > 100 residues
 - **P3 — Method C — Hybrid architecture**: Mix Mamba and Transformer layers (e.g., 3:1 ratio) to combine Mamba's linear complexity with Transformer's global information mixing
 - **Ablation studies**: Systematic comparison of combine modes (concat vs gate vs add), d_state values, and Mamba vs Attention across trajectory lengths and residue counts
