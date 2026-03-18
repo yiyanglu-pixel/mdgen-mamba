@@ -56,17 +56,39 @@ def _get_mamba_cls(version: int):
 
 def _build_mamba(version: int, d_model: int, d_state: int, d_conv: int,
                  expand: int, headdim: int):
-    """Instantiate a Mamba v1 or v2 block with the right kwargs."""
+    """Instantiate a Mamba v1 or v2 block with the right kwargs.
+
+    For Mamba-2, two alignment constraints must be satisfied:
+      1. d_inner (= d_model * expand) must be divisible by headdim
+      2. nheads (= d_inner / headdim) must be a multiple of 8, because
+         d_in_proj = 2*d_inner + 2*ngroups*d_state + nheads and causal_conv1d
+         requires stride(2) = d_in_proj to be a multiple of 8.  The first two
+         terms are already multiples of 8, so nheads % 8 == 0 is sufficient.
+    If the requested headdim violates either constraint, it is automatically
+    adjusted downward to the largest valid value.
+    """
     cls = _get_mamba_cls(version)
     if cls is Mamba2:
-        # Mamba-2 constraint: d_inner (= d_model * expand) must be divisible by headdim
         d_inner = d_model * expand
-        if d_inner % headdim != 0:
-            # Auto-adjust headdim down to the largest factor <= requested headdim
-            for hd in range(headdim, 0, -1):
-                if d_inner % hd == 0:
+        # Find largest headdim <= requested that satisfies both constraints
+        if (d_inner % headdim != 0) or ((d_inner // headdim) % 8 != 0):
+            orig_headdim = headdim
+            headdim = None
+            for hd in range(orig_headdim, 0, -1):
+                if d_inner % hd == 0 and (d_inner // hd) % 8 == 0:
                     headdim = hd
                     break
+            if headdim is None:
+                raise ValueError(
+                    f"Cannot find valid headdim for d_inner={d_inner}: "
+                    f"need d_inner % headdim == 0 and (d_inner/headdim) % 8 == 0"
+                )
+        nheads = d_inner // headdim
+        d_in_proj = 2 * d_inner + 2 * d_state + nheads  # ngroups=1
+        assert d_in_proj % 8 == 0, (
+            f"d_in_proj={d_in_proj} not aligned to 8 "
+            f"(d_inner={d_inner}, headdim={headdim}, nheads={nheads})"
+        )
         return cls(
             d_model=d_model,
             d_state=d_state,
